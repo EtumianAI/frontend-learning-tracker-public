@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import AuthDialog from './components/AuthDialog.jsx';
 import Sidebar from './components/Sidebar.jsx';
 import Stats from './components/Stats.jsx';
 import TopicCard from './components/TopicCard.jsx';
@@ -7,8 +8,10 @@ import QuestionForm from './components/QuestionForm.jsx';
 import PracticeCard from './components/PracticeCard.jsx';
 import ReviewList from './components/ReviewList.jsx';
 import { initialQuestions, loadState, saveState, exportState } from './lib/storage.js';
-import { sections } from './data/topics.js';
+import { initialTopics, sections } from './data/topics.js';
 import { makeId } from './lib/utils.js';
+import { loadCloudState, saveCloudState } from './lib/cloudStorage.js';
+import { isCloudConfigured, supabase } from './lib/supabaseClient.js';
 
 const descriptions = {
   overview: ['Мой план обучения', 'Начни с одной темы, затем закрепи её практикой.'],
@@ -20,6 +23,13 @@ const descriptions = {
 
 export default function App() {
   const [state, setState] = useState(loadState);
+  const [authReady, setAuthReady] = useState(!supabase);
+  const [user, setUser] = useState(null);
+  const [showAuth, setShowAuth] = useState(false);
+  const [passwordRecovery, setPasswordRecovery] = useState(false);
+  const [cloudReady, setCloudReady] = useState(!supabase);
+  const [cloudStatus, setCloudStatus] = useState(supabase ? 'checking' : 'local');
+  const [cloudRetry, setCloudRetry] = useState(0);
   const [view, setView] = useState('overview');
   const [search, setSearch] = useState('');
   const [level, setLevel] = useState('Все уровни');
@@ -28,8 +38,97 @@ export default function App() {
   const [formSection, setFormSection] = useState(null);
   const [showQuestionForm, setShowQuestionForm] = useState(false);
   const [toast, setToast] = useState('');
+  const lastUserId = useRef(null);
+  const saveQueue = useRef(Promise.resolve());
 
   useEffect(() => { saveState(state); }, [state]);
+  useEffect(() => {
+    if (!supabase) return undefined;
+    let active = true;
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'PASSWORD_RECOVERY') {
+        setPasswordRecovery(true);
+        setShowAuth(true);
+      }
+      if (!session?.user && lastUserId.current) {
+        setState({ items: initialTopics.map((item) => ({ ...item })), errors: [], answer: '', seen: [], questions: [] });
+        lastUserId.current = null;
+      }
+      setUser(session?.user ?? null);
+      setAuthReady(true);
+    });
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!active) return;
+      if (error) setToast('Не удалось проверить сессию. Попробуй обновить страницу.');
+      setUser(data?.session?.user ?? null);
+      setAuthReady(true);
+    });
+    return () => { active = false; subscription.unsubscribe(); };
+  }, []);
+
+  useEffect(() => {
+    if (!authReady) return undefined;
+    if (!user || !supabase) {
+      if (lastUserId.current) {
+        setState({ items: initialTopics.map((item) => ({ ...item })), errors: [], answer: '', seen: [], questions: [] });
+        lastUserId.current = null;
+      }
+      setCloudReady(true);
+      setCloudStatus('local');
+      return undefined;
+    }
+
+    let active = true;
+    lastUserId.current = user.id;
+    setCloudReady(false);
+    setCloudStatus('loading');
+
+    (async () => {
+      try {
+        const cloudState = await loadCloudState(supabase, user.id);
+        if (!active) return;
+        if (cloudState) {
+          setState(cloudState);
+        } else {
+          // Preserve this browser's existing progress when a user signs up for the first time.
+          const localState = loadState();
+          await saveCloudState(supabase, user.id, localState);
+          if (!active) return;
+          setState(localState);
+        }
+        setCloudStatus('saved');
+        setCloudReady(true);
+      } catch (error) {
+        if (!active) return;
+        setCloudStatus('error');
+        setToast('Не удалось загрузить данные: ' + error.message);
+      }
+    })();
+
+    return () => { active = false; };
+  }, [authReady, user?.id, cloudRetry]);
+
+  useEffect(() => {
+    if (!user || !cloudReady || !supabase) return undefined;
+    const userId = user.id;
+    const snapshot = JSON.parse(JSON.stringify(state));
+    const timer = window.setTimeout(() => {
+      setCloudStatus('saving');
+      saveQueue.current = saveQueue.current
+        .catch(() => undefined)
+        .then(() => saveCloudState(supabase, userId, snapshot))
+        .then(() => {
+          if (lastUserId.current === userId) setCloudStatus('saved');
+        })
+        .catch((error) => {
+          if (lastUserId.current === userId) {
+            setCloudStatus('error');
+            setToast('Не удалось сохранить данные: ' + error.message);
+          }
+        });
+    }, 650);
+    return () => window.clearTimeout(timer);
+  }, [state, user?.id, cloudReady]);
   useEffect(() => {
     if (!toast) return undefined;
     const timer = window.setTimeout(() => setToast(''), 2200);
@@ -81,9 +180,19 @@ export default function App() {
   const topicGrid = (list = visibleItems) => <div className="cards">{list.length ? list.map((item) => <TopicCard key={item.id} item={item} onChange={changeItem} onEdit={setEditingTopic} onDelete={removeTopic} />) : <div className="empty">По этому фильтру тем пока нет.</div>}</div>;
   const controls = <div className="toolbar"><input className="input" placeholder="Поиск по темам и заметкам…" value={search} onChange={(event) => setSearch(event.target.value)} /><select className="select" value={level} onChange={(event) => setLevel(event.target.value)}><option>Все уровни</option><option>Стажёр</option><option>Junior</option></select><select className="select" value={status} onChange={(event) => setStatus(event.target.value)}><option>Все статусы</option><option>Запланировано</option><option>В работе</option><option>Завершено</option></select><button className="btn" onClick={() => { setEditingTopic(null); setFormSection(view in sections ? view : 'javascript'); }}>＋ Добавить тему</button></div>;
 
+  if (!authReady) {
+    return <div className="sync-screen"><section className="sync-card"><span className="brand-mark">&lt;/&gt;</span><h1>Проверяю вход…</h1><p>Секунду, открываю твой профиль.</p></section></div>;
+  }
+
+  if (authReady && user && !cloudReady) {
+    return <div className="sync-screen"><section className="sync-card"><span className="brand-mark">&lt;/&gt;</span><h1>{cloudStatus === 'error' ? 'Не удалось открыть профиль' : 'Загружаю твой прогресс…'}</h1><p>{cloudStatus === 'error' ? 'Проверь подключение и настройки базы. Данные не будут показаны, пока профиль не загрузится.' : 'Подключаюсь к личному хранилищу.'}</p>{cloudStatus === 'error' && <div className="sync-actions"><button className="btn primary" onClick={() => setCloudRetry((value) => value + 1)}>Повторить</button><button className="btn" onClick={() => supabase.auth.signOut()}>Выйти</button></div>}</section></div>;
+  }
+
+  const cloudStatusLabel = cloudStatus === 'saving' ? 'Сохраняю…' : cloudStatus === 'saved' ? 'Синхронизировано' : cloudStatus === 'error' ? 'Ошибка синхронизации' : cloudStatus === 'loading' ? 'Загружаю…' : 'Локально';
+
   return (
     <div className="shell">
-      <header className="topbar"><div className="brand"><span className="brand-mark">&lt;/&gt;</span><span>Трекер frontend-разработчика</span></div><div className="top-actions"><button className="btn ghost desktop" onClick={() => exportState(state)}>Экспорт данных</button><button className="btn primary" onClick={() => { setEditingTopic(null); setFormSection('javascript'); }}>＋ Быстро добавить</button></div></header>
+      <header className="topbar"><div className="brand"><span className="brand-mark">&lt;/&gt;</span><span>Трекер frontend-разработчика</span></div><div className="top-actions"><button className="btn ghost desktop" onClick={() => exportState(state)}>Экспорт данных</button>{isCloudConfigured ? (user ? <div className="account-menu"><div className="account-label"><strong>{user.email}</strong><small>{cloudStatusLabel}</small></div><button className="btn ghost" onClick={async () => { const { error } = await supabase.auth.signOut(); if (error) setToast('Не удалось выйти: ' + error.message); }}>Выйти</button></div> : <button className="btn" onClick={() => setShowAuth(true)}>Войти / регистрация</button>) : <span className="cloud-status local">Только этот браузер</span>}<button className="btn primary" onClick={() => { setEditingTopic(null); setFormSection('javascript'); }}>＋ Быстро добавить</button></div></header>
       <section className="hero"><div><div className="eyebrow">Твой маршрут · стажёр → junior</div><h1>Учись. Практикуй.<br />Объясняй своими словами.</h1><p>Один рабочий стол для тем, задач и подготовки к собеседованиям. Записывай не только что прошёл, но и что уже можешь объяснить без подсказки.</p></div><div className="hero-side"><strong>Твой фокус сейчас</strong>JavaScript уже знакомее. React даётся тяжелее — поэтому здесь он выделен отдельно и чаще попадает в тренировку.</div></section>
       <Stats items={items} errors={state.errors} />
       <div className="layout"><Sidebar view={view} onChange={(next) => { setView(next); setSearch(''); setLevel('Все уровни'); setStatus('Все статусы'); }} items={items} errors={state.errors} />
@@ -95,9 +204,10 @@ export default function App() {
           {view === 'errors' && <section className="panel"><div className="section-head"><div><h2>{title}</h2><p>{desc}</p></div><button className="btn" onClick={() => setView('practice')}>＋ Новая тренировка</button></div><ReviewList errors={state.errors} onResolve={(id) => setState((current) => ({ ...current, errors: current.errors.map((error) => error.id === id ? { ...error, resolved: true } : error) }))} onDelete={(id) => setState((current) => ({ ...current, errors: current.errors.filter((error) => error.id !== id) }))} /></section>}
         </main>
       </div>
-      <footer>Данные хранятся в этом браузере · выгрузи резервную копию, если меняешь устройство</footer>
+      <footer>{user ? 'Аккаунт ' + user.email + ' · ' + cloudStatusLabel : isCloudConfigured ? 'Войди по почте, чтобы синхронизировать данные между устройствами.' : 'Данные пока хранятся в этом браузере · после подключения БД появится вход по почте'}</footer>
       {(editingTopic || formSection) && <TopicForm item={editingTopic} section={formSection} onSave={saveTopic} onClose={() => { setEditingTopic(null); setFormSection(null); }} />}
       {showQuestionForm && <QuestionForm onSave={addQuestion} onClose={() => setShowQuestionForm(false)} />}
+      {showAuth && supabase && <AuthDialog client={supabase} recoveryMode={passwordRecovery} onClose={() => { setShowAuth(false); setPasswordRecovery(false); }} />}
       {toast && <div role="status" className="toast show">{toast}</div>}
     </div>
   );
